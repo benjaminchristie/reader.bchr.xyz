@@ -40,18 +40,6 @@ When stdin closes, it keeps listening. Examples:
 echo "build finished" | ./reader -name ci "$ROOM"   # post a message (Ctrl-C / kill to stop)
 ```
 
-### Local testing
+The reader reconnects by itself when the connection drops. The one exception is when the site's admins block the room:
+then it prints "this room has been closed" and exits with status 1.
 
-Use a link from a local stack, and the server comes from the link. For example, with the site's
-`docker compose -f dev/compose.yaml up` running:
-
-```sh
-./reader http://localhost:8080/#/some-room
-```
-
-### How the encryption works
-
-The room code never leaves your machine. PBKDF2 and HKDF derive an anonymous room ID from it, which is all the
-server sees, plus an AES-256-GCM key. Messages and files are encrypted with that key, and file names are hidden
-inside the encrypted messages. This must stay compatible with `src/app/room-crypto.ts` in the bchr.xyz repo.
-`go test` checks a room ID produced by the browser code.

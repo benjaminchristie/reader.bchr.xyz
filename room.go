@@ -51,6 +51,12 @@ const (
 
 var fileIDRegexp = regexp.MustCompile("^[A-Za-z0-9_-]{1,128}$")
 
+// ErrRoomClosed means the site's admins blocked the room: the server answers
+// 410 Gone and closes connections with status 4001.
+var ErrRoomClosed = errors.New("this room has been closed by the site's admins")
+
+const statusRoomClosed websocket.StatusCode = 4001
+
 // Chat is the plaintext of every message. Field names match the website.
 type Chat struct {
 	ID        string   `json:"id"`
@@ -169,6 +175,9 @@ func (r *Room) Subscribe(ctx context.Context, onOpen func(), handle func(Chat)) 
 	}()
 	for {
 		_, msg, err := c.Read(ctx)
+		if websocket.CloseStatus(err) == statusRoomClosed {
+			return ErrRoomClosed
+		}
 		if err != nil {
 			return err
 		}
@@ -297,6 +306,9 @@ func (r *Room) do(req *http.Request, want int) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusGone {
+		return ErrRoomClosed
+	}
 	if resp.StatusCode != want {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		return fmt.Errorf("%s %s: %s %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(msg)))

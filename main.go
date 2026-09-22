@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -104,6 +105,7 @@ func main() {
 		downloads: make(chan Chat, 1024),
 		outbox:    make(chan string, 256),
 		joined:    make(chan struct{}),
+		closed:    make(chan struct{}),
 	}
 	app.run(ctx)
 }
@@ -160,6 +162,7 @@ type App struct {
 	quitWarned     bool
 	joined         chan struct{} // closed on the first successful connection
 	joinOnce       sync.Once
+	closed         chan struct{} // closed when an admin blocks the room
 }
 
 func (a *App) run(ctx context.Context) {
@@ -185,8 +188,12 @@ func (a *App) run(ctx context.Context) {
 		os.Exit(code)
 	}
 	go func() {
-		<-ctx.Done() // SIGTERM / SIGHUP (Ctrl-C arrives as a key in raw mode)
-		shutdown(130)
+		select {
+		case <-ctx.Done(): // SIGTERM / SIGHUP (Ctrl-C arrives as a key in raw mode)
+			shutdown(130)
+		case <-a.closed:
+			shutdown(1)
+		}
 	}()
 
 	u := a.ui
@@ -343,6 +350,11 @@ func (a *App) subscribeLoop(ctx context.Context) {
 		}
 		a.ui.SetOnline(false)
 		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrRoomClosed) {
+			a.ui.Print(a.ui.style("31", ErrRoomClosed.Error()))
+			close(a.closed)
 			return
 		}
 		if msg := err.Error(); msg != lastErr {
