@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,9 +56,17 @@ var fileIDRegexp = regexp.MustCompile("^[A-Za-z0-9_-]{1,128}$")
 // 410 Gone and closes connections with status 4001.
 var ErrRoomClosed = errors.New("this room has been closed by the site's admins")
 
-const statusRoomClosed websocket.StatusCode = 4001
+// ErrBanned means the site's admins banned this address (403, close 4002).
+var ErrBanned = errors.New("you have been banned from bchr.xyz")
 
-// Chat is the plaintext of every message. Field names match the website.
+const (
+	statusRoomClosed websocket.StatusCode = 4001
+	statusBanned     websocket.StatusCode = 4002
+)
+
+// Chat is the plaintext of every message. Field names match the website
+// (src/app/chat-item/chat-item.component.ts); everything after Mime is optional
+// and was added later.
 type Chat struct {
 	ID        string   `json:"id"`
 	Timestamp string   `json:"timestamp,omitempty"`
@@ -67,20 +76,109 @@ type Chat struct {
 	FileID    string   `json:"fileId,omitempty"`
 	Size      *float64 `json:"size,omitempty"`
 	Mime      string   `json:"mime,omitempty"`
+
+	// msg (or empty), emote, system, edit, delete, react, typing, presence;
+	// "announce" is only used locally for the server's announcements
+	Type     string    `json:"type,omitempty"`
+	MID      string    `json:"mid,omitempty"` // message id
+	SID      string    `json:"sid,omitempty"` // sender's session id
+	ReplyTo  *ReplyRef `json:"replyTo,omitempty"`
+	Fwd      string    `json:"fwd,omitempty"`      // original author of a forwarded message
+	TTL      float64   `json:"ttl,omitempty"`      // seconds until it disappears (web clients delete it)
+	Target   string    `json:"target,omitempty"`   // message an edit/delete/react applies to
+	Emoji    string    `json:"emoji,omitempty"`    // react
+	On       *bool     `json:"on,omitempty"`       // react/pin: added (true) or removed (false)
+	Presence string    `json:"presence,omitempty"` // join, here, leave
+
+	// history rooms: a newcomer's join asks for the conversation so far, and
+	// someone already in the room sends it as a "history" message
+	WantHistory bool   `json:"wantHistory,omitempty"`
+	To          string `json:"to,omitempty"`      // history: the session it's for
+	History     []Chat `json:"history,omitempty"` // history: oldest first
+	Edited      bool   `json:"edited,omitempty"`  // history items that were edited
+
+	Away       bool      `json:"away,omitempty"`       // presence: /away
+	Hidden     bool      `json:"hidden,omitempty"`     // presence: an invisible user (don't list them)
+	Spoiler    bool      `json:"spoiler,omitempty"`    // hidden until asked for (/reveal)
+	Voice      bool      `json:"voice,omitempty"`      // a file that is a recorded voice note
+	Options    []string  `json:"options,omitempty"`    // poll
+	Nuke       bool      `json:"nuke,omitempty"`       // poll: a vote to wipe the room
+	Electorate int       `json:"electorate,omitempty"` // nuke poll: people present when proposed
+	Choice     *int      `json:"choice,omitempty"`     // vote: option index, -1 takes it back
+	Until      string    `json:"until,omitempty"`      // timer: when it ends
+	Votes      []Vote    `json:"votes,omitempty"`      // polls passed on in history
+	Pinned     bool      `json:"pinned,omitempty"`     // history: the pinned message
+	Title      string    `json:"title,omitempty"`      // forum: the forum's or a thread's title
+	Thread     string    `json:"thread,omitempty"`     // forum: the thread a post replies to
+	Files      []FileRef `json:"files,omitempty"`      // forum: attachments
+
+	// local only: the name doesn't match who the server says sent it, and who
+	// that is (edits, deletes and votes are matched on it)
+	Unverified bool   `json:"-"`
+	By         string `json:"-"`
 }
+
+// FileRef is a file attached to a forum post.
+type FileRef struct {
+	FileID   string  `json:"fileId"`
+	Filename string  `json:"filename"`
+	Size     float64 `json:"size"`
+	Mime     string  `json:"mime"`
+}
+
+type Vote struct {
+	SID    string `json:"sid"`
+	Name   string `json:"name"`
+	Choice int    `json:"choice"`
+}
+
+type ReplyRef struct {
+	MID  string `json:"mid"`
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
+const idAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 
 type envelope struct {
 	V  int    `json:"v"`
 	IV string `json:"iv"`
 	CT string `json:"ct"`
+	// added by the server when it relays a message: who really sent it (an
+	// account, or a guest name it handed out). Clients can't set it.
+	By string `json:"by,omitempty"`
 }
 
 type Room struct {
-	Server string // e.g. https://bchr.xyz
-	Secret string // the part of the link after #/
-	ID     string // derived room id used in every API path
+	Server string   // e.g. https://bchr.xyz
+	Secret string   // the part of the link after #/
+	ID     string   // derived room id used in every API path
+	SID    string   // this client's session id in the room
+	Words  []string // safety words (/verify); the same for everyone with the link
 	aead   cipher.AEAD
 	client *http.Client
+}
+
+// identify sends a header with every request: the login token, or the guest
+// token, so the server can vouch for our name.
+type identify struct {
+	header, value string
+}
+
+func (t identify) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set(t.header, t.value)
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// SignedIn makes requests as the account the token belongs to.
+func (r *Room) SignedIn(token string) {
+	r.client.Transport = identify{"Authorization", "Bearer " + token}
+}
+
+// AsGuest makes requests as the guest the token was issued to.
+func (r *Room) AsGuest(token string) {
+	r.client.Transport = identify{"X-Bchr-Guest", token}
 }
 
 // ParseRoom accepts a full invite link (https://bchr.xyz/#/<secret>) or a bare
@@ -108,6 +206,10 @@ func NewRoom(server, secret string) (*Room, error) {
 	master := pbkdf2SHA256([]byte(secret), []byte(pbkdf2Salt), pbkdf2Iterations, 32)
 	id := hkdfSHA256(master, nil, []byte("room-id"), 16)
 	key := hkdfSHA256(master, nil, []byte("room-key"), 32)
+	var words []string
+	for _, b := range hkdfSHA256(master, nil, []byte("verify"), 4) {
+		words = append(words, safetyWords[b])
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -120,9 +222,17 @@ func NewRoom(server, secret string) (*Room, error) {
 		Server: strings.TrimRight(server, "/"),
 		Secret: secret,
 		ID:     hex.EncodeToString(id),
+		SID:    randomString(12, idAlphabet),
+		Words:  words,
 		aead:   aead,
 		client: &http.Client{},
 	}, nil
+}
+
+// SharesHistory reports whether the room passes its conversation on to people
+// who join later. It's chosen when the room is created: those links start with "h-".
+func (r *Room) SharesHistory() bool {
+	return strings.HasPrefix(r.Secret, "h-")
 }
 
 // Link is the invite link to open the room in a browser.
@@ -132,7 +242,12 @@ func (r *Room) Link() string {
 
 // Initialize makes sure the server knows the room (it forgets rooms on restart).
 func (r *Room) Initialize(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/initialize", strings.NewReader(r.ID))
+	// history rooms ask the server to keep recent messages for newcomers
+	path := "/initialize"
+	if r.SharesHistory() {
+		path += "?history=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+path, strings.NewReader(r.ID))
 	if err != nil {
 		return err
 	}
@@ -143,6 +258,9 @@ func (r *Room) Initialize(ctx context.Context) error {
 // ctx is cancelled. Messages that do not decrypt with this room's key are ignored.
 func (r *Room) Subscribe(ctx context.Context, onOpen func(), handle func(Chat)) error {
 	wsURL := "ws" + strings.TrimPrefix(r.Server, "http") + "/" + r.ID + "/subscribe"
+	if t := r.ticket(ctx); t != "" {
+		wsURL += "?ticket=" + url.QueryEscape(t)
+	}
 	c, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		return err
@@ -178,8 +296,17 @@ func (r *Room) Subscribe(ctx context.Context, onOpen func(), handle func(Chat)) 
 		if websocket.CloseStatus(err) == statusRoomClosed {
 			return ErrRoomClosed
 		}
+		if websocket.CloseStatus(err) == statusBanned {
+			return ErrBanned
+		}
 		if err != nil {
 			return err
+		}
+		if frame, ok := parseServerFrame(msg); ok {
+			if frame != nil {
+				handle(*frame)
+			}
+			continue
 		}
 		if chat, ok := r.decryptChat(msg); ok {
 			handle(chat)
@@ -187,20 +314,252 @@ func (r *Room) Subscribe(ctx context.Context, onOpen func(), handle func(Chat)) 
 	}
 }
 
+// ticket asks for a one-time ticket that tells the server who's behind the
+// websocket (it counts /nuke votes per person). "" without a name or on error.
+func (r *Room) ticket(ctx context.Context) string {
+	if r.client.Transport == nil {
+		return ""
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/room/"+r.ID+"/ticket", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Ticket string `json:"ticket"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return ""
+	}
+	return out.Ticket
+}
+
+// Publish sends a message to the room, filling in the session and message ids.
 func (r *Room) Publish(ctx context.Context, chat Chat) error {
+	return r.publish(ctx, chat, false)
+}
+
+// Signal sends a presence or typing update (not counted as a message).
+func (r *Room) Signal(ctx context.Context, chat Chat) error {
+	return r.publish(ctx, chat, true)
+}
+
+func (r *Room) publish(ctx context.Context, chat Chat, signal bool) error {
+	chat.SID = r.SID
+	if chat.Timestamp == "" {
+		chat.Timestamp = nowISO()
+	}
+	// everything shown in the conversation needs an id (replies, votes, edits)
+	if chat.MID == "" && (chat.Type == "" || chat.Type == "msg" || chat.Type == "emote" || chat.Type == "system" ||
+		chat.Type == "poll" || chat.Type == "timer") {
+		chat.MID = randomString(16, idAlphabet)
+	}
 	body, err := r.encryptChat(chat)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/"+r.ID+"/publish", strings.NewReader(string(body)))
+	url := r.Server + "/" + r.ID + "/publish"
+	if signal {
+		url += "?kind=signal"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
 	return r.do(req, http.StatusAccepted)
 }
 
-func (r *Room) SendText(ctx context.Context, name, text string) error {
-	return r.Publish(ctx, Chat{ID: name, Timestamp: nowISO(), Data: text})
+// parseServerFrame recognises the server's own plaintext frames and turns them
+// into local messages: {"announce": ...} (type "announce"), {"notice": ...}
+// ("notice") and {"state": ...} ("state"; Until is set while the room is
+// frozen). The server only relays encrypted envelopes from clients, so these
+// can't be forged. A nil Chat with ok means "nothing to show".
+func parseServerFrame(msg []byte) (*Chat, bool) {
+	s := string(msg)
+	if !strings.HasPrefix(s, `{"announce"`) && !strings.HasPrefix(s, `{"notice"`) && !strings.HasPrefix(s, `{"state"`) &&
+		!strings.HasPrefix(s, `{"nuke"`) && !strings.HasPrefix(s, `{"replay"`) && !strings.HasPrefix(s, `{"here"`) &&
+		!strings.HasPrefix(s, `{"cleared"`) {
+		return nil, false
+	}
+	var frame struct {
+		Announce *struct {
+			Text, By, Until string
+			Countdown       bool
+		} `json:"announce"`
+		Notice *struct{ Text, By string } `json:"notice"`
+		State  *struct {
+			FrozenUntil *string `json:"frozenUntil"`
+		} `json:"state"`
+		Cleared *struct {
+			At string `json:"at"`
+		} `json:"cleared"` // the site's admins deleted the files shared before At
+		Replay *int      `json:"replay"` // history rooms: this many earlier messages follow
+		Here   *[]string `json:"here"`   // who's here (names the server vouches for)
+		Nuke   *struct {
+			By                          string
+			Until                       string
+			Electorate, Needed, Yes, No int
+			Passed                      bool
+		} `json:"nuke"`
+	}
+	if json.Unmarshal(msg, &frame) != nil {
+		return nil, false
+	}
+	switch {
+	case frame.Announce != nil:
+		text := frame.Announce.Text
+		if t, err := time.Parse(time.RFC3339Nano, frame.Announce.Until); err == nil && frame.Announce.Countdown {
+			text += " (at " + t.Local().Format("15:04") + ")"
+		}
+		return &Chat{Type: "announce", ID: frame.Announce.By, Data: text}, true
+	case frame.Notice != nil:
+		return &Chat{Type: "notice", ID: frame.Notice.By, Data: frame.Notice.Text}, true
+	case frame.Cleared != nil:
+		return &Chat{Type: "cleared", Until: frame.Cleared.At}, true
+	case frame.Replay != nil:
+		return &Chat{Type: "replay", Data: strconv.Itoa(*frame.Replay)}, true
+	case frame.Here != nil:
+		return &Chat{Type: "here", Options: *frame.Here}, true
+	case frame.Nuke != nil:
+		n := frame.Nuke
+		c := &Chat{Type: "nukevote", ID: n.By, Nuke: n.Passed}
+		if n.Passed {
+			c.Data = fmt.Sprintf("%d of %d agreed", n.Yes, n.Electorate)
+		} else {
+			left := ""
+			if t, err := time.Parse(time.RFC3339Nano, n.Until); err == nil {
+				left = fmt.Sprintf(", until %s", t.Local().Format("15:04"))
+			}
+			c.Data = fmt.Sprintf("%d of %d needed%s", n.Yes, n.Needed, left)
+		}
+		return c, true
+	case frame.State != nil:
+		c := &Chat{Type: "state"}
+		if frame.State.FrozenUntil != nil {
+			c.Until = *frame.State.FrozenUntil
+		}
+		return c, true
+	}
+	return nil, true // {"announce": null}: nothing to show
+}
+
+// IsForum reports whether the link is a forum's (they start with "f-"): its
+// posts are stored, encrypted, until the forum expires.
+func (r *Room) IsForum() bool {
+	return strings.HasPrefix(r.Secret, "f-")
+}
+
+type ForumInfo struct {
+	Expires time.Time `json:"expires"`
+	Posts   int       `json:"posts"`
+}
+
+func (r *Room) ForumInfo(ctx context.Context) (ForumInfo, error) {
+	var info ForumInfo
+	req, err := http.NewRequestWithContext(ctx, "GET", r.Server+"/profile/forum/"+r.ID, nil)
+	if err != nil {
+		return info, err
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return info, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return info, errors.New("this forum doesn't exist any more (forums are deleted when they expire)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return info, fmt.Errorf("forum: %s", resp.Status)
+	}
+	return info, json.NewDecoder(resp.Body).Decode(&info)
+}
+
+// ForumLog returns every event stored in the forum, decrypted, oldest first.
+func (r *Room) ForumLog(ctx context.Context) ([]Chat, error) {
+	var out []Chat
+	after := int64(0)
+	for {
+		url := fmt.Sprintf("%s/profile/forum/%s/log?after=%d&limit=500", r.Server, r.ID, after)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var page []struct {
+			Seq  int64  `json:"seq"`
+			Body string `json:"body"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&page)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range page {
+			if c, ok := r.decryptChat([]byte(p.Body)); ok {
+				out = append(out, c)
+			}
+			after = p.Seq
+		}
+		if len(page) < 500 {
+			return out, nil
+		}
+	}
+}
+
+// ForumPost stores an event in the forum; the server also relays it to the room.
+func (r *Room) ForumPost(ctx context.Context, chat Chat) error {
+	chat.SID = r.SID
+	chat.Timestamp = nowISO()
+	if chat.MID == "" {
+		chat.MID = randomString(16, idAlphabet)
+	}
+	body, err := r.encryptChat(chat)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/forum/"+r.ID+"/log", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	return r.do(req, http.StatusCreated)
+}
+
+// Nuke votes to wipe the room (or to keep it). The server counts the votes
+// and deletes the files; everyone hears about it in a {"nuke": ...} frame.
+func (r *Room) Nuke(ctx context.Context, wipe bool) error {
+	body := `{"wipe":false}`
+	if wipe {
+		body = `{"wipe":true}`
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/room/"+r.ID+"/nuke", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	return r.do(req, http.StatusOK)
+}
+
+// Report tells the site's admins about the room: "report" (room id only),
+// "flag" (hands them the link so they can join) or "feature" (an idea).
+func (r *Room) Report(ctx context.Context, kind, reason, reporter string) error {
+	body := map[string]string{"kind": kind, "reason": reason, "reporter": reporter}
+	if kind == "flag" {
+		body["secret"] = r.Secret
+	} else {
+		body["room"] = r.ID
+	}
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/report", strings.NewReader(string(b)))
+	if err != nil {
+		return err
+	}
+	return r.do(req, http.StatusCreated)
 }
 
 // Upload encrypts the file while streaming it to the server, then announces it
@@ -309,6 +668,9 @@ func (r *Room) do(req *http.Request, want int) error {
 	if resp.StatusCode == http.StatusGone {
 		return ErrRoomClosed
 	}
+	if resp.StatusCode == http.StatusForbidden && strings.HasSuffix(req.URL.Path, "/initialize") {
+		return ErrBanned
+	}
 	if resp.StatusCode != want {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		return fmt.Errorf("%s %s: %s %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(msg)))
@@ -360,6 +722,8 @@ func (r *Room) decryptChat(raw []byte) (Chat, bool) {
 	if chat.ID == "" {
 		chat.ID = "unknown"
 	}
+	chat.Unverified = env.By == "" || env.By != chat.ID
+	chat.By = env.By
 	return chat, true
 }
 
@@ -548,4 +912,34 @@ func (p *progressReader) Read(b []byte) (int, error) {
 		p.fn(float64(p.done) / float64(p.total))
 	}
 	return n, err
+}
+
+// 256 words for /verify, one per byte. Must match SAFETY_WORDS in the website
+// (src/app/room-crypto.ts).
+var safetyWords = [256]string{
+	"acid", "acorn", "actor", "adobe", "agent", "alarm", "album", "alien", "alley", "amber", "angel",
+	"ankle", "apple", "apron", "arena", "arrow", "aspen", "atlas", "attic", "award", "bacon", "badge",
+	"bagel", "baker", "bamboo", "banjo", "barn", "basil", "beach", "beard", "beaver", "bench",
+	"berry", "bison", "blade", "blaze", "bloom", "blues", "board", "bonus", "boots", "brain", "brass",
+	"bread", "brick", "bride", "broom", "brush", "bucket", "buddy", "bugle", "cabin", "cable",
+	"cactus", "camel", "candy", "canoe", "canyon", "cargo", "carrot", "castle", "cedar", "chalk",
+	"charm", "cheese", "cherry", "chess", "chief", "chili", "cider", "cinema", "circus", "citrus",
+	"clam", "cliff", "cloud", "clover", "coast", "cobra", "cocoa", "comet", "coral", "cotton",
+	"couch", "cow", "crab", "crane", "crayon", "creek", "crown", "cube", "cupid", "curry", "daisy",
+	"dance", "delta", "denim", "desk", "diary", "dingo", "disco", "dock", "dolphin", "donut",
+	"dragon", "dream", "drum", "duck", "dune", "eagle", "easel", "echo", "eclipse", "elbow", "elder",
+	"elephant", "elk", "ember", "emerald", "engine", "falcon", "fancy", "feather", "fern", "ferry",
+	"fiddle", "fig", "finch", "flame", "flask", "flute", "foam", "forest", "fossil", "fox", "frost",
+	"fudge", "galaxy", "garden", "garlic", "gecko", "genie", "ginger", "glacier", "globe", "goose",
+	"grape", "gravy", "guitar", "gumbo", "hammer", "harbor", "harp", "hazel", "hedge", "helmet",
+	"heron", "hippo", "honey", "hornet", "husky", "igloo", "iguana", "island", "ivory", "jacket",
+	"jaguar", "jazz", "jelly", "jewel", "jungle", "kayak", "kettle", "kiwi", "koala", "ladder",
+	"lagoon", "lemon", "lens", "lilac", "lime", "linen", "lion", "llama", "lobster", "locket",
+	"lotus", "lunar", "mango", "maple", "marble", "meadow", "melon", "mint", "mirror", "mocha",
+	"monkey", "moose", "mosaic", "muffin", "nectar", "needle", "noodle", "nutmeg", "oasis", "ocean",
+	"olive", "onion", "opal", "orbit", "orchid", "otter", "owl", "oyster", "paddle", "panda",
+	"papaya", "parrot", "pastel", "peach", "pebble", "pepper", "piano", "pickle", "pilot", "pine",
+	"pixel", "planet", "plum", "polar", "pony", "poppy", "prism", "pumpkin", "puzzle", "quartz",
+	"quill", "rabbit", "radar", "radish", "raven", "reef", "robin", "rocket", "rose", "ruby",
+	"saddle", "salmon", "sapphire", "satin", "scarf", "shadow", "shell", "sierra", "silver", "sketch",
 }

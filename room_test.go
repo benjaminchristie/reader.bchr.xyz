@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -114,5 +115,41 @@ func TestSafeFilename(t *testing.T) {
 func TestClean(t *testing.T) {
 	if got := clean("a\x1b[31mb\x07‮c\nd", true); got != "a[31mbc\nd" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestParseServerFrame(t *testing.T) {
+	c, ok := parseServerFrame([]byte(`{"announce":{"text":"hi","by":"ben","at":"x","until":"y"}}`))
+	if !ok || c == nil || c.Type != "announce" || c.Data != "hi" || c.ID != "ben" {
+		t.Fatalf("announce: %v %+v", ok, c)
+	}
+	if c, ok := parseServerFrame([]byte(`{"announce":null}`)); !ok || c != nil {
+		t.Fatalf("clear: %v %+v", ok, c)
+	}
+	if c, ok := parseServerFrame([]byte(`{"notice":{"text":"be nice","by":"boss"}}`)); !ok || c.Type != "notice" || c.Data != "be nice" {
+		t.Fatalf("notice: %v %+v", ok, c)
+	}
+	if c, ok := parseServerFrame([]byte(`{"state":{"frozenUntil":"2030-01-01T00:00:00Z","cap":0}}`)); !ok || c.Type != "state" || c.Until == "" {
+		t.Fatalf("state: %v %+v", ok, c)
+	}
+	if _, ok := parseServerFrame([]byte(`{"v":1,"iv":"a","ct":"b"}`)); ok {
+		t.Fatal("envelope taken for a server frame")
+	}
+}
+
+// the website derives the same words (src/app/room-crypto.ts, WebCrypto)
+func TestSafetyWordsMatchBrowser(t *testing.T) {
+	r, _ := NewRoom("", "abc123")
+	if got := strings.Join(r.Words, " "); got != "goose cocoa pastel actor" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNewFieldsRoundTrip(t *testing.T) {
+	r, _ := NewRoom("", "room")
+	raw, _ := r.encryptChat(Chat{ID: "ben", Data: "yes", MID: "m1", SID: r.SID, ReplyTo: &ReplyRef{MID: "m0", ID: "amy", Text: "ok?"}})
+	c, ok := r.decryptChat(raw)
+	if !ok || c.ReplyTo == nil || c.ReplyTo.Text != "ok?" || c.MID != "m1" || c.SID == "" {
+		t.Fatalf("%v %+v", ok, c)
 	}
 }
