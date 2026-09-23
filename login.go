@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,11 +62,16 @@ func guestName(server string) (name, token string, err error) {
 }
 
 func askPassword() (string, error) {
+	return askSecret("Password: ", "-login needs a terminal to ask for the password, or set BCHR_PASSWORD")
+}
+
+// askSecret reads a line from the terminal without echoing it.
+func askSecret(prompt, noTerminal string) (string, error) {
 	fd := int(os.Stdin.Fd())
 	if !isTerminal(fd) {
-		return "", fmt.Errorf("-login needs a terminal to ask for the password, or set BCHR_PASSWORD")
+		return "", errors.New(noTerminal)
 	}
-	fmt.Fprint(os.Stderr, "Password: ")
+	fmt.Fprint(os.Stderr, prompt)
 	restore, ok := makeRaw(fd)
 	if !ok {
 		return "", fmt.Errorf("can't read a password here; set BCHR_PASSWORD")

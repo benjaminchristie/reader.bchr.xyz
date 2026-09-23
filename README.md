@@ -63,6 +63,41 @@ Forum links (they start with `f-`) open as a forum: the reader lists the threads
 `/post <n> <text>` replies and `/thread <title> | <text>` starts a new one. New threads and replies from others
 show up as they're posted.
 
+Rooms can have a name, a password and rules set by their owner on the website. The reader shows the name,
+topic and welcome note when it joins; for a password room pass `-password` (or `BCHR_ROOM_PASSWORD`), or it asks.
+
+### Keeping a room going
+
+History rooms (links starting with `h-`, or customized rooms with **Share history** on) show newcomers the last 500
+messages, but the server only keeps them while someone is in the room, and forgets two minutes after it empties.
+For a long-running group chat, `keep-room.sh` keeps the reader in the room and restarts it if it stops:
+
+```sh
+KEEPER_LOGIN=archive BCHR_PASSWORD=… KEEPER_INVISIBLE=1 ./keep-room.sh "https://bchr.xyz/#/h-yourroom…"
+```
+
+- `KEEPER_LOGIN` / `BCHR_PASSWORD`: a separate account for the keeper (optional; without it the keeper is a guest).
+- `KEEPER_INVISIBLE=1`: the keeper doesn't show up as here or count in `/nuke` votes (needs an account).
+- `BCHR_ROOM_PASSWORD`: the room's password, for password rooms.
+- `KEEPER_LOG=room.log`: also save what's said, as plain text on that machine (guard it).
+
+To run it for good, e.g. with systemd (`~/.config/systemd/user/keep-room.service`, then
+`systemctl --user enable --now keep-room`):
+
+```ini
+[Service]
+Environment=KEEPER_LOGIN=archive BCHR_PASSWORD=… KEEPER_INVISIBLE=1
+ExecStart=/path/to/keep-room.sh https://bchr.xyz/#/h-yourroom…
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+Limits: the history lives in the server's memory, so a server restart (or a `/nuke`) still clears it, and only the
+last 1000 messages (8 MB) are kept. Files stay as long as the room is in use. For a room that keeps everything through
+restarts, ask the site's admins to **keep it alive** (then no keeper is needed).
+
 The reader reconnects by itself when the connection drops. The one exception is when the site's admins block the room:
 then it prints "this room has been closed" and exits with status 1.
 

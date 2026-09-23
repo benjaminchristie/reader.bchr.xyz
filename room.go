@@ -147,6 +147,9 @@ type envelope struct {
 	// added by the server when it relays a message: who really sent it (an
 	// account, or a guest name it handed out). Clients can't set it.
 	By string `json:"by,omitempty"`
+	// also added by the server: sent as typing or presence (which skip the
+	// room owner's rules); anything else marked like this was snuck in
+	Sig bool `json:"sig,omitempty"`
 }
 
 type Room struct {
@@ -157,28 +160,88 @@ type Room struct {
 	Words  []string // safety words (/verify); the same for everyone with the link
 	aead   cipher.AEAD
 	client *http.Client
+
+	// who we are (the login or guest token), so the server can vouch for our
+	// name, and for password rooms the token that proves the password
+	idHeader, idValue string
+	access            string
+	Invisible         bool // not listed as here or counted (accounts only, like the website)
 }
 
-// identify sends a header with every request: the login token, or the guest
-// token, so the server can vouch for our name.
-type identify struct {
-	header, value string
-}
+// roomTransport adds our identity and the room's access token to every request.
+type roomTransport struct{ r *Room }
 
-func (t identify) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t roomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
-	req.Header.Set(t.header, t.value)
+	if t.r.idHeader != "" {
+		req.Header.Set(t.r.idHeader, t.r.idValue)
+	}
+	if t.r.access != "" {
+		req.Header.Set("X-Bchr-Access", t.r.access)
+	}
 	return http.DefaultTransport.RoundTrip(req)
 }
 
 // SignedIn makes requests as the account the token belongs to.
 func (r *Room) SignedIn(token string) {
-	r.client.Transport = identify{"Authorization", "Bearer " + token}
+	r.idHeader, r.idValue = "Authorization", "Bearer "+token
 }
 
 // AsGuest makes requests as the guest the token was issued to.
 func (r *Room) AsGuest(token string) {
-	r.client.Transport = identify{"X-Bchr-Guest", token}
+	r.idHeader, r.idValue = "X-Bchr-Guest", token
+}
+
+// ErrPassword: the room has a password and we don't have the right one.
+var ErrPassword = errors.New("this room has a password")
+
+// SetPassword switches to a password room's keys (like the website's
+// deriveRoom): the id stays, the key, safety words and access token come from
+// link + password.
+func (r *Room) SetPassword(password string) error {
+	master := pbkdf2SHA256([]byte(r.Secret+"\x00"+password), []byte(pbkdf2Salt+"/password"), pbkdf2Iterations, 32)
+	block, err := aes.NewCipher(hkdfSHA256(master, nil, []byte("room-key"), 32))
+	if err != nil {
+		return err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	var words []string
+	for _, b := range hkdfSHA256(master, nil, []byte("verify"), 4) {
+		words = append(words, safetyWords[b])
+	}
+	r.aead, r.Words = aead, words
+	r.access = base64.RawURLEncoding.EncodeToString(hkdfSHA256(master, nil, []byte("access"), 32))
+	return nil
+}
+
+// Card is a room's name and look, set by its owner (encrypted with the room key).
+type Card struct {
+	Name    string `json:"name"`
+	Emoji   string `json:"emoji"`
+	Topic   string `json:"topic"`
+	Welcome string `json:"welcome"`
+}
+
+// OpenCard decrypts a room's card ("" if there's none).
+func (r *Room) OpenCard(envelopeJSON string) (Card, bool) {
+	var card Card
+	var env envelope
+	if json.Unmarshal([]byte(envelopeJSON), &env) != nil {
+		return card, false
+	}
+	iv, err1 := base64.StdEncoding.DecodeString(env.IV)
+	ct, err2 := base64.StdEncoding.DecodeString(env.CT)
+	if err1 != nil || err2 != nil || len(iv) != ivBytes {
+		return card, false
+	}
+	plain, err := r.aead.Open(nil, iv, ct, []byte("msg"))
+	if err != nil || json.Unmarshal(plain, &card) != nil {
+		return card, false
+	}
+	return card, true
 }
 
 // ParseRoom accepts a full invite link (https://bchr.xyz/#/<secret>) or a bare
@@ -218,15 +281,26 @@ func NewRoom(server, secret string) (*Room, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Room{
+	room := &Room{
 		Server: strings.TrimRight(server, "/"),
 		Secret: secret,
-		ID:     hex.EncodeToString(id),
+		ID:     roomIDPrefix(secret) + hex.EncodeToString(id),
 		SID:    randomString(12, idAlphabet),
 		Words:  words,
 		aead:   aead,
 		client: &http.Client{},
-	}, nil
+	}
+	room.client.Transport = roomTransport{room}
+	return room, nil
+}
+
+// roomIDPrefix: customized rooms (links starting with "c-") have ids starting
+// with "r", which the server keeps apart from plain rooms (like the website).
+func roomIDPrefix(secret string) string {
+	if strings.HasPrefix(secret, "c-") {
+		return "r"
+	}
+	return ""
 }
 
 // SharesHistory reports whether the room passes its conversation on to people
@@ -317,10 +391,14 @@ func (r *Room) Subscribe(ctx context.Context, onOpen func(), handle func(Chat)) 
 // ticket asks for a one-time ticket that tells the server who's behind the
 // websocket (it counts /nuke votes per person). "" without a name or on error.
 func (r *Room) ticket(ctx context.Context) string {
-	if r.client.Transport == nil {
+	if r.idHeader == "" {
 		return ""
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/room/"+r.ID+"/ticket", nil)
+	body := `{"hidden":false}`
+	if r.Invisible {
+		body = `{"hidden":true}`
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/room/"+r.ID+"/ticket", strings.NewReader(body))
 	if err != nil {
 		return ""
 	}
@@ -382,7 +460,7 @@ func parseServerFrame(msg []byte) (*Chat, bool) {
 	s := string(msg)
 	if !strings.HasPrefix(s, `{"announce"`) && !strings.HasPrefix(s, `{"notice"`) && !strings.HasPrefix(s, `{"state"`) &&
 		!strings.HasPrefix(s, `{"nuke"`) && !strings.HasPrefix(s, `{"replay"`) && !strings.HasPrefix(s, `{"here"`) &&
-		!strings.HasPrefix(s, `{"cleared"`) {
+		!strings.HasPrefix(s, `{"cleared"`) && !strings.HasPrefix(s, `{"settings"`) && !strings.HasPrefix(s, `{"archive"`) {
 		return nil, false
 	}
 	var frame struct {
@@ -394,9 +472,19 @@ func parseServerFrame(msg []byte) (*Chat, bool) {
 		State  *struct {
 			FrozenUntil *string `json:"frozenUntil"`
 		} `json:"state"`
+		Settings *struct {
+			Owner, Card string
+			Protected   bool
+			Slow, Cap   int
+			OwnerOnly   bool `json:"ownerOnly"`
+		} `json:"settings"` // the room's name, look and rules from its owner
 		Cleared *struct {
 			At string `json:"at"`
 		} `json:"cleared"` // the site's admins deleted the files shared before At
+		Archive *struct {
+			Max   int    `json:"max"`
+			Until string `json:"until"`
+		} `json:"archive"` // kept alive: messages (the last Max; 0 = all) and files stay after everyone leaves
 		Replay *int      `json:"replay"` // history rooms: this many earlier messages follow
 		Here   *[]string `json:"here"`   // who's here (names the server vouches for)
 		Nuke   *struct {
@@ -418,8 +506,35 @@ func parseServerFrame(msg []byte) (*Chat, bool) {
 		return &Chat{Type: "announce", ID: frame.Announce.By, Data: text}, true
 	case frame.Notice != nil:
 		return &Chat{Type: "notice", ID: frame.Notice.By, Data: frame.Notice.Text}, true
+	case frame.Settings != nil:
+		st := frame.Settings
+		var rules []string
+		if st.Protected {
+			rules = append(rules, "password")
+		}
+		if st.OwnerOnly {
+			rules = append(rules, "only "+st.Owner+" posts")
+		}
+		if st.Slow > 0 {
+			rules = append(rules, fmt.Sprintf("slow mode %ds", st.Slow))
+		}
+		if st.Cap > 0 {
+			rules = append(rules, fmt.Sprintf("up to %d people", st.Cap))
+		}
+		return &Chat{Type: "settings", ID: st.Owner, Data: st.Card, Title: strings.Join(rules, " · ")}, true
 	case frame.Cleared != nil:
 		return &Chat{Type: "cleared", Until: frame.Cleared.At}, true
+	case frame.Archive != nil:
+		kept := "indefinitely"
+		if t, err := time.Parse(time.RFC3339Nano, frame.Archive.Until); err == nil {
+			kept = "until " + t.Local().Format("Jan 2")
+		}
+		if frame.Archive.Max > 0 {
+			kept += fmt.Sprintf(", last %d messages", frame.Archive.Max)
+		}
+		return &Chat{Type: "archive", Data: kept}, true
+	case strings.HasPrefix(s, `{"archive":null`):
+		return &Chat{Type: "archive"}, true
 	case frame.Replay != nil:
 		return &Chat{Type: "replay", Data: strconv.Itoa(*frame.Replay)}, true
 	case frame.Here != nil:
@@ -671,6 +786,9 @@ func (r *Room) do(req *http.Request, want int) error {
 	if resp.StatusCode == http.StatusForbidden && strings.HasSuffix(req.URL.Path, "/initialize") {
 		return ErrBanned
 	}
+	if resp.StatusCode == http.StatusUnauthorized && strings.HasSuffix(req.URL.Path, "/initialize") {
+		return ErrPassword
+	}
 	if resp.StatusCode != want {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		return fmt.Errorf("%s %s: %s %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(msg)))
@@ -721,6 +839,9 @@ func (r *Room) decryptChat(raw []byte) (Chat, bool) {
 	}
 	if chat.ID == "" {
 		chat.ID = "unknown"
+	}
+	if env.Sig && chat.Type != "presence" && chat.Type != "typing" {
+		return Chat{}, false
 	}
 	chat.Unverified = env.By == "" || env.By != chat.ID
 	chat.By = env.By

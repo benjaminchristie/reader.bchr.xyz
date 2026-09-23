@@ -58,12 +58,16 @@ forums (links starting with f-):
   /link               show the invite link
   /quit               leave (Ctrl-C and Ctrl-D work too)`
 
+var roomPassword *string
+
 func main() {
 	server := flag.String("server", "https://bchr.xyz", "server to use when <room> is not a full link")
 	dir := flag.String("dir", "files", "directory to save received files to")
 	login := flag.String("login", "", "sign in as this user, so your username is your name (password from BCHR_PASSWORD or a prompt); otherwise you're anon-NNNN")
+	invisible := flag.Bool("invisible", false, "don't show up as here or count in /nuke votes (needs -login), e.g. to keep a history room going")
 	autosave := flag.Bool("autosave", true, "download files shared by others automatically")
 	page := flag.String("page", "", "room link or code (alternative to the <room> argument)")
+	roomPassword = flag.String("password", "", "the room's password, for rooms that have one (or BCHR_ROOM_PASSWORD; asked for otherwise)")
 	flag.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(), usageText)
 		flag.PrintDefaults()
@@ -101,6 +105,12 @@ func main() {
 	if err != nil {
 		fatalf("%v", err)
 	}
+	if *roomPassword == "" {
+		*roomPassword = os.Getenv("BCHR_ROOM_PASSWORD")
+	}
+	if *roomPassword != "" {
+		room.SetPassword(*roomPassword)
+	}
 	// only signed-in people have names; everyone else is a guest (anon-NNNN).
 	// Either way the server vouches for the name, so others see it as verified.
 	name := fmt.Sprintf("anon-%04d", 1000+rand.Intn(9000))
@@ -110,6 +120,9 @@ func main() {
 			fatalf("%v", err)
 		}
 		room.SignedIn(token)
+		room.Invisible = *invisible
+	} else if *invisible {
+		fatalf("-invisible needs -login (only accounts can be invisible)")
 	} else if guest, token, err := guestName(srv); err == nil {
 		name = guest
 		room.AsGuest(token)
@@ -119,6 +132,21 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	// password rooms: ask (up to three times) before going in
+	for tries := 0; ; tries++ {
+		err := room.Initialize(ctx)
+		if !errors.Is(err, ErrPassword) {
+			break
+		}
+		if tries == 3 || (tries == 0 && *roomPassword != "" && !isTerminal(int(os.Stdin.Fd()))) {
+			fatalf("wrong password")
+		}
+		pw, perr := askSecret("Room password: ", "this room has a password: use -password or BCHR_ROOM_PASSWORD")
+		if perr != nil {
+			fatalf("%v", perr)
+		}
+		room.SetPassword(pw)
+	}
 
 	if send {
 		os.Exit(runSend(ctx, room, name, args))
@@ -595,6 +623,30 @@ func (a *App) receive(c Chat) {
 			u.Print(u.style("2", "── sent before you joined ──"))
 		}
 		return
+	case "settings": // the room's name, look and rules
+		card, _ := a.room.OpenCard(c.Data)
+		head := strings.TrimSpace(clean(card.Emoji+" "+card.Name, false))
+		if head == "" {
+			head = "room"
+		}
+		if card.Topic != "" {
+			head += " — " + clean(card.Topic, false)
+		}
+		u.Print(u.style("1", "── "+head+" ──") + u.style("2", " owner "+clean(c.ID, false)))
+		if c.Title != "" {
+			u.Print(u.style("2", c.Title))
+		}
+		if card.Welcome != "" {
+			u.Print(clean(card.Welcome, true))
+		}
+		return
+	case "archive": // the admins keep (or stop keeping) this room's messages on the server
+		if c.Data == "" {
+			u.Print(u.style("2", "🗄 this room is no longer kept alive"))
+		} else {
+			u.Print(u.style("2", "🗄 this room is kept alive ("+c.Data+"): messages and files stay when everyone leaves"))
+		}
+		return
 	case "cleared": // the site's admins deleted the files shared so far
 		until, _ := time.Parse(time.RFC3339Nano, c.Until)
 		a.mu.Lock()
@@ -883,6 +935,9 @@ func (a *App) seen(c Chat) {
 }
 
 func (a *App) signal(ctx context.Context, c Chat) {
+	if a.room.Invisible && c.Type == "presence" {
+		return // invisible: nobody hears from us unless we post
+	}
 	c.ID = a.getName()
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
