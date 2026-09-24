@@ -153,3 +153,31 @@ func TestNewFieldsRoundTrip(t *testing.T) {
 		t.Fatalf("%v %+v", ok, c)
 	}
 }
+
+// Tags from the website (room-crypto.ts mentionTag) for the same rooms.
+func TestMentionTagsMatchBrowser(t *testing.T) {
+	r, err := NewRoom("https://bchr.xyz", "abcdefghijklmnopqrstuvwxyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ID != "8f407cc992ec5f29e760538e25f8d29d" || r.mentionTag("Ben") != "f5641010d946b1ecb792b9ae9b473739" {
+		t.Fatalf("got %s %s", r.ID, r.mentionTag("Ben"))
+	}
+	p, _ := NewRoom("https://bchr.xyz", "c-abcdefghijklmnopqrstuvwx")
+	if err := p.SetPassword("hunter2"); err != nil {
+		t.Fatal(err)
+	}
+	if p.ID != "rff6143a410be46362c190bfd6ffc55fd" || p.mentionTag("amy") != "df82315e7bdc5b98fd7860aa153ab22e" {
+		t.Fatalf("password room: %s %s", p.ID, p.mentionTag("amy"))
+	}
+	names := mentionedNames(Chat{Data: "hey @Ben. and @amy-2, see @ben", ReplyTo: &ReplyRef{ID: "Cat"}})
+	if strings.Join(names, ",") != "ben.,ben,amy-2,cat" {
+		t.Fatalf("names: %v", names)
+	}
+	if q := r.tagQuery(Chat{Data: "no one"}); q != "" {
+		t.Fatalf("query: %q", q)
+	}
+	if q := r.tagQuery(Chat{Data: "@Ben hi"}); q != "?tags=f5641010d946b1ecb792b9ae9b473739" {
+		t.Fatalf("query: %q", q)
+	}
+}

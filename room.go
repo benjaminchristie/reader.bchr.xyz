@@ -153,13 +153,14 @@ type envelope struct {
 }
 
 type Room struct {
-	Server string   // e.g. https://bchr.xyz
-	Secret string   // the part of the link after #/
-	ID     string   // derived room id used in every API path
-	SID    string   // this client's session id in the room
-	Words  []string // safety words (/verify); the same for everyone with the link
-	aead   cipher.AEAD
-	client *http.Client
+	Server  string   // e.g. https://bchr.xyz
+	Secret  string   // the part of the link after #/
+	ID      string   // derived room id used in every API path
+	SID     string   // this client's session id in the room
+	Words   []string // safety words (/verify); the same for everyone with the link
+	aead    cipher.AEAD
+	mention []byte // HMAC key for mention tags (see mentionTag)
+	client  *http.Client
 
 	// who we are (the login or guest token), so the server can vouch for our
 	// name, and for password rooms the token that proves the password
@@ -213,6 +214,7 @@ func (r *Room) SetPassword(password string) error {
 		words = append(words, safetyWords[b])
 	}
 	r.aead, r.Words = aead, words
+	r.mention = hkdfSHA256(master, nil, []byte("mention"), 32)
 	r.access = base64.RawURLEncoding.EncodeToString(hkdfSHA256(master, nil, []byte("access"), 32))
 	return nil
 }
@@ -282,13 +284,14 @@ func NewRoom(server, secret string) (*Room, error) {
 		return nil, err
 	}
 	room := &Room{
-		Server: strings.TrimRight(server, "/"),
-		Secret: secret,
-		ID:     roomIDPrefix(secret) + hex.EncodeToString(id),
-		SID:    randomString(12, idAlphabet),
-		Words:  words,
-		aead:   aead,
-		client: &http.Client{},
+		Server:  strings.TrimRight(server, "/"),
+		Secret:  secret,
+		ID:      roomIDPrefix(secret) + hex.EncodeToString(id),
+		SID:     randomString(12, idAlphabet),
+		Words:   words,
+		aead:    aead,
+		mention: hkdfSHA256(master, nil, []byte("mention"), 32),
+		client:  &http.Client{},
 	}
 	room.client.Transport = roomTransport{room}
 	return room, nil
@@ -422,6 +425,61 @@ func (r *Room) Publish(ctx context.Context, chat Chat) error {
 }
 
 // Signal sends a presence or typing update (not counted as a message).
+// notifies reports whether a message is worth a push notification; edits,
+// votes and the like are sent as "quiet" (see the site's backend push.go).
+func notifies(chat Chat) bool {
+	switch chat.Type {
+	case "", "msg", "emote", "poll", "thread", "post":
+		return true
+	}
+	return false
+}
+
+// Mentions: people can ask to be notified only when someone @mentions them.
+// The server matches tags, HMAC(a key from the room link, name), so it
+// doesn't learn names (the website's room-crypto.ts mentionTag).
+func (r *Room) mentionTag(name string) string {
+	m := hmac.New(sha256.New, r.mention)
+	m.Write([]byte(strings.ToLower(name)))
+	return hex.EncodeToString(m.Sum(nil)[:16])
+}
+
+var mentionRe = regexp.MustCompile(`@([\w.-]+)`)
+
+// mentionedNames: @names in the text and whoever it replies to, lowercased.
+func mentionedNames(chat Chat) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(n string) {
+		if n != "" && !seen[n] && len(out) < 20 {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	for _, m := range mentionRe.FindAllStringSubmatch(chat.Data, -1) {
+		n := strings.ToLower(m[1])
+		add(n)
+		add(strings.TrimRight(n, ".-")) // "@bob." at the end of a sentence
+	}
+	if chat.ReplyTo != nil {
+		add(strings.ToLower(chat.ReplyTo.ID))
+	}
+	return out
+}
+
+// "?tags=..." for the names a message mentions, or "".
+func (r *Room) tagQuery(chat Chat) string {
+	names := mentionedNames(chat)
+	if len(names) == 0 || r.mention == nil {
+		return ""
+	}
+	tags := make([]string, len(names))
+	for i, n := range names {
+		tags[i] = r.mentionTag(n)
+	}
+	return "?tags=" + strings.Join(tags, ",")
+}
+
 func (r *Room) Signal(ctx context.Context, chat Chat) error {
 	return r.publish(ctx, chat, true)
 }
@@ -443,6 +501,10 @@ func (r *Room) publish(ctx context.Context, chat Chat, signal bool) error {
 	url := r.Server + "/" + r.ID + "/publish"
 	if signal {
 		url += "?kind=signal"
+	} else if !notifies(chat) {
+		url += "?kind=quiet"
+	} else {
+		url += r.tagQuery(chat)
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
 	if err != nil {
@@ -639,7 +701,13 @@ func (r *Room) ForumPost(ctx context.Context, chat Chat) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", r.Server+"/profile/forum/"+r.ID+"/log", strings.NewReader(string(body)))
+	url := r.Server + "/profile/forum/" + r.ID + "/log"
+	if !notifies(chat) {
+		url += "?kind=quiet"
+	} else {
+		url += r.tagQuery(chat)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
